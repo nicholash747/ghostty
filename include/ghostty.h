@@ -1130,6 +1130,19 @@ void* ghostty_surface_quicklook_font(ghostty_surface_t);
 bool ghostty_surface_quicklook_word(ghostty_surface_t, ghostty_text_s*);
 #endif
 
+// Manual I/O backend — for embedding without a child process.
+// When ghostty_surface_config_s.command is NULL, the surface uses the
+// manual backend. Use these functions to feed/read bytes.
+
+/// Feed terminal output bytes from the host (e.g. SSH data) into the
+/// terminal for display. Thread-safe.
+void ghostty_surface_feed_terminal_output(ghostty_surface_t, const void*, size_t);
+
+/// Read terminal input bytes (responses) to send back to the host.
+/// Returns number of bytes written to buf. Returns 0 if no data or
+/// if the surface is not using the manual backend. Thread-safe.
+size_t ghostty_surface_read_terminal_input(ghostty_surface_t, void*, size_t);
+
 ghostty_inspector_t ghostty_surface_inspector(ghostty_surface_t);
 void ghostty_inspector_free(ghostty_surface_t);
 void ghostty_inspector_set_focus(ghostty_inspector_t, bool);

@@ -1974,6 +1974,41 @@ pub const CAPI = struct {
         );
     }
 
+    /// Feed terminal output bytes from the host (e.g. SSH transport)
+    /// into the terminal for display. This is the "SSH → screen" path.
+    ///
+    /// Thread-safe: acquires the renderer mutex internally.
+    export fn ghostty_surface_feed_terminal_output(
+        surface: *Surface,
+        data: [*]const u8,
+        len: usize,
+    ) void {
+        if (len == 0) return;
+        surface.core_surface.io.processOutput(data[0..len]);
+    }
+
+    /// Read terminal input bytes (responses, key echoes) that should
+    /// be sent back to the host (e.g. SSH transport). This is the
+    /// "screen → SSH" path.
+    ///
+    /// Returns the number of bytes written to `buf`. Returns 0 if:
+    ///   - No data is available
+    ///   - The backend is not the manual backend
+    ///
+    /// Thread-safe: the manual backend uses an internal mutex.
+    export fn ghostty_surface_read_terminal_input(
+        surface: *Surface,
+        buf: [*]u8,
+        len: usize,
+    ) usize {
+        if (len == 0) return 0;
+        const manual = switch (surface.core_surface.io.backend) {
+            .manual => |*m| m,
+            else => return 0,
+        };
+        return manual.readInput(buf[0..len]);
+    }
+
     export fn ghostty_surface_inspector(ptr: *Surface) ?*Inspector {
         return ptr.initInspector() catch |err| {
             log.err("error initializing inspector err={}", .{err});
