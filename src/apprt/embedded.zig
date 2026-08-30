@@ -1827,6 +1827,26 @@ pub const CAPI = struct {
         return n;
     }
 
+    /// Copy the visible viewport's text (rows joined by newlines) into
+    /// buf as UTF-8. Returns bytes written; truncates at buf_len. Backs
+    /// the host's UITextInput document for native selection gestures.
+    export fn ghostty_surface_viewport_text(
+        surface: *Surface,
+        buf: [*]u8,
+        buf_len: usize,
+    ) usize {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        const alloc = surface.core_surface.alloc;
+        const text = state.terminal.screens.active
+            .dumpStringAlloc(alloc, .{ .viewport = .{} }) catch return 0;
+        defer alloc.free(text);
+        const n = @min(text.len, buf_len);
+        @memcpy(buf[0..n], text[0..n]);
+        return n;
+    }
+
     /// True when the running program enabled any xterm mouse reporting
     /// mode - taps should then be forwarded as mouse clicks so TUIs
     /// (e.g. Claude Code) can move their cursor to the tapped cell.
