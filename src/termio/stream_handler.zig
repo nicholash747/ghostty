@@ -27,6 +27,12 @@ pub const StreamHandler = struct {
     /// Mailbox for data to the termio thread.
     termio_mailbox: *termio.Mailbox,
 
+    /// When set, write messages (terminal responses) bypass the mailbox
+    /// and go directly to the Manual backend's input ring. This prevents
+    /// the 64-slot SPSC queue from filling when the IO thread is dead
+    /// (iOS — xev doesn't run).
+    manual_backend: ?*termio.Manual = null,
+
     /// Mailbox for the surface.
     surface_mailbox: apprt.surface.Mailbox,
 
@@ -126,6 +132,19 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         msg: apprt.surface.Message,
     ) void {
+        // For the Manual backend, use instant-only push to prevent
+        // blocking. The app mailbox (surface messages go through it)
+        // is only drained by ghostty_app_tick() on the main thread.
+        // During processOutput() the main thread is busy, so the
+        // mailbox can't be drained. If 64+ surface messages are
+        // generated in a single processOutput() call, .forever would
+        // deadlock. Drop the message instead — the host app can
+        // re-query state if needed.
+        if (self.manual_backend != null) {
+            _ = self.surface_mailbox.push(msg, .{ .instant = {} });
+            return;
+        }
+
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
@@ -136,6 +155,24 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        // For the Manual backend, bypass the IO mailbox entirely.
+        // The IO thread is dead on iOS (xev doesn't run), so the
+        // 64-slot SPSC queue fills up and blocks the main thread
+        // forever. Write messages go directly to the input ring;
+        // all other messages (synchronized_output, linefeed_mode,
+        // resize, etc.) are no-ops without a running IO thread.
+        if (self.manual_backend) |m| {
+            switch (msg) {
+                .write_small => |v| m.writeInputDirect(v.data[0..v.len]),
+                .write_stable => |v| m.writeInputDirect(v),
+                .write_alloc => |v| {
+                    m.writeInputDirect(v.data);
+                    v.alloc.free(v.data);
+                },
+                else => {},
+            }
+            return;
+        }
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }
@@ -148,6 +185,14 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         msg: renderer.Message,
     ) void {
+        // For the Manual backend, use instant-only push. The renderer
+        // thread may not be draining its mailbox on iOS, and we call
+        // updateFrame/drawFrame manually from the host.
+        if (self.manual_backend != null) {
+            _ = self.renderer_mailbox.push(msg, .{ .instant = {} });
+            return;
+        }
+
         // See termio.Mailbox.send for more details on how this works.
 
         // Try instant first. If it works then we can return.

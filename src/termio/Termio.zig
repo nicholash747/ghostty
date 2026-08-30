@@ -317,6 +317,14 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .terminal_stream = .initAlloc(alloc, handler),
         .thread_enter_state = thread_enter_state,
     };
+
+    // Fix up the manual_backend pointer. The handler was created
+    // before self.* was assigned, so we couldn't point into self
+    // yet. Now that self.backend is in its final location, set it.
+    switch (self.backend) {
+        .manual => |*m| self.terminal_stream.handler.manual_backend = m,
+        else => {},
+    }
 }
 
 pub fn deinit(self: *Termio) void {
@@ -512,8 +520,14 @@ pub fn resize(
         }
     }
 
-    // Mail the renderer so that it can update the GPU and re-render
-    _ = self.renderer_mailbox.push(.{ .resize = size }, .{ .forever = {} });
+    // Mail the renderer so that it can update the GPU and re-render.
+    // For the manual backend, use instant (non-blocking) to prevent
+    // deadlock if the renderer thread isn't draining its mailbox.
+    const timeout: @TypeOf(self.renderer_mailbox.*).Timeout = switch (self.backend) {
+        .manual => .{ .instant = {} },
+        .exec => .{ .forever = {} },
+    };
+    _ = self.renderer_mailbox.push(.{ .resize = size }, timeout);
     self.renderer_wakeup.notify() catch {};
 }
 
@@ -686,7 +700,9 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
 /// Process output from readdata but the lock is already held.
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
     // Schedule a render. We can call this first because we have the lock.
-    self.terminal_stream.handler.queueRender() catch unreachable;
+    // Use catch {} instead of catch unreachable to avoid UB in
+    // ReleaseFast if the xev Async notify fails (Mach port error).
+    self.terminal_stream.handler.queueRender() catch {};
 
     // Whenever a character is typed, we ensure the cursor is in the
     // non-blink state so it is rendered if visible. If we're under

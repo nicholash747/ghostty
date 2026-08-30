@@ -52,7 +52,7 @@ const RingBuffer = struct {
     }
 
     /// Write as many bytes as fit. Returns count written.
-    fn write(self: *RingBuffer, data: []const u8) usize {
+    pub fn write(self: *RingBuffer, data: []const u8) usize {
         var written: usize = 0;
         for (data) |byte| {
             const next = (self.write_pos + 1) % RING_CAPACITY;
@@ -83,6 +83,14 @@ input_ring: RingBuffer,
 
 /// Protects input_ring across threads.
 mutex: std.Thread.Mutex,
+
+/// Write directly to the input ring (thread-safe). Used by the
+/// StreamHandler to bypass the IO mailbox for terminal responses.
+pub fn writeInputDirect(self: *Manual, data: []const u8) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    _ = self.input_ring.write(data);
+}
 
 // ── Backend interface ────────────────────────────────────────────
 
