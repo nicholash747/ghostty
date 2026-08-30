@@ -1744,6 +1744,99 @@ pub const CAPI = struct {
         len.* = c.len;
     }
 
+    /// Select the cell range [start...end] in viewport coordinates.
+    /// Returns false if either coordinate is out of range. Direct call
+    /// (renderer mutex); the renderer draws the selection on the next
+    /// frame rebuild.
+    export fn ghostty_surface_select_cells(
+        surface: *Surface,
+        start_col: u16,
+        start_row: u16,
+        end_col: u16,
+        end_row: u16,
+    ) bool {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        const screen = state.terminal.screens.active;
+        const start = screen.pages.pin(.{ .viewport = .{
+            .x = start_col,
+            .y = start_row,
+        } }) orelse return false;
+        const end = screen.pages.pin(.{ .viewport = .{
+            .x = end_col,
+            .y = end_row,
+        } }) orelse return false;
+        const sel = terminal.Selection.init(start, end, false);
+        screen.select(sel) catch return false;
+        return true;
+    }
+
+    /// Word-select at a viewport cell (long-press). Returns false when
+    /// the cell has no text.
+    export fn ghostty_surface_select_word_at(
+        surface: *Surface,
+        col: u16,
+        row: u16,
+    ) bool {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        const screen = state.terminal.screens.active;
+        const pin = screen.pages.pin(.{ .viewport = .{
+            .x = col,
+            .y = row,
+        } }) orelse return false;
+        const sel = screen.selectWord(
+            pin,
+            surface.core_surface.config.selection_word_chars,
+        ) orelse return false;
+        screen.select(sel) catch return false;
+        return true;
+    }
+
+    /// Clear any active selection.
+    export fn ghostty_surface_clear_selection(surface: *Surface) void {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        state.terminal.screens.active.select(null) catch {};
+    }
+
+    /// Copy the selection text into buf (UTF-8). Returns the number of
+    /// bytes written, or 0 when there is no selection. Truncates at
+    /// buf_len.
+    export fn ghostty_surface_selection_text(
+        surface: *Surface,
+        buf: [*]u8,
+        buf_len: usize,
+    ) usize {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        const screen = state.terminal.screens.active;
+        const sel = screen.selection orelse return 0;
+        const alloc = surface.core_surface.alloc;
+        const text = screen.selectionString(alloc, .{
+            .sel = sel,
+            .trim = true,
+        }) catch return 0;
+        defer alloc.free(text);
+        const n = @min(text.len, buf_len);
+        @memcpy(buf[0..n], text[0..n]);
+        return n;
+    }
+
+    /// True when the running program enabled any xterm mouse reporting
+    /// mode - taps should then be forwarded as mouse clicks so TUIs
+    /// (e.g. Claude Code) can move their cursor to the tapped cell.
+    export fn ghostty_surface_mouse_reporting(surface: *Surface) bool {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        return state.terminal.flags.mouse_event != .none;
+    }
+
     /// Directly resize the terminal grid, bypassing the IO thread.
     /// On iOS the IO thread's xev event loop doesn't run, so the
     /// normal resize path through queueIo is dead. Updates the screen
