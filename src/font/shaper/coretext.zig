@@ -37,6 +37,11 @@ const log = std.log.scoped(.font_shaper);
 ///     See: https://github.com/mitchellh/ghostty/issues/1643
 ///
 pub const Shaper = struct {
+    /// Whether to use a dedicated CF release thread. On iOS, xev event
+    /// loops don't work reliably, so we release synchronously instead.
+    /// This also avoids the thread join deadlock in deinit.
+    const use_release_thread = (builtin.os.tag != .ios);
+
     /// The allocated used for the feature list, font cache, and cell buf.
     alloc: Allocator,
 
@@ -74,9 +79,9 @@ pub const Shaper = struct {
 
     /// Dedicated thread for releasing CoreFoundation objects. Some objects,
     /// such as those produced by CoreText, have excessively slow release
-    /// callback logic.
-    cf_release_thread: *CFReleaseThread,
-    cf_release_thr: std.Thread,
+    /// callback logic. Disabled on iOS where xev doesn't work.
+    cf_release_thread: if (use_release_thread) *CFReleaseThread else void,
+    cf_release_thr: if (use_release_thread) std.Thread else void,
 
     const CellBuf = std.ArrayListUnmanaged(font.shape.Cell);
     const CodepointList = std.ArrayListUnmanaged(Codepoint);
@@ -201,19 +206,24 @@ pub const Shaper = struct {
         };
         errdefer typesetter_attr_dict.release();
 
-        // Create the CF release thread.
-        var cf_release_thread = try alloc.create(CFReleaseThread);
-        errdefer alloc.destroy(cf_release_thread);
-        cf_release_thread.* = try .init(alloc);
-        errdefer cf_release_thread.deinit();
+        // Create and start the CF release thread (non-iOS only).
+        // On iOS, xev event loops don't work reliably, so CFRelease
+        // is done synchronously in endFrame instead.
+        var cf_release_thread: if (use_release_thread) *CFReleaseThread else void = undefined;
+        var cf_release_thr: if (use_release_thread) std.Thread else void = undefined;
+        if (use_release_thread) {
+            cf_release_thread = try alloc.create(CFReleaseThread);
+            errdefer alloc.destroy(cf_release_thread);
+            cf_release_thread.* = try .init(alloc);
+            errdefer cf_release_thread.deinit();
 
-        // Start the CF release thread.
-        var cf_release_thr = try std.Thread.spawn(
-            .{},
-            CFReleaseThread.threadMain,
-            .{cf_release_thread},
-        );
-        cf_release_thr.setName("cf_release") catch {};
+            cf_release_thr = try std.Thread.spawn(
+                .{},
+                CFReleaseThread.threadMain,
+                .{cf_release_thread},
+            );
+            cf_release_thr.setName("cf_release") catch {};
+        }
 
         return .{
             .alloc = alloc,
@@ -249,22 +259,24 @@ pub const Shaper = struct {
 
             // For tests this logic is normal because we don't want to
             // wait for a release thread. But in production this is a bug
-            // and we should warn.
-            if (comptime !builtin.is_test) log.warn(
+            // and we should warn. On iOS releases are always synchronous
+            // so a non-empty pool at deinit is expected normal behavior.
+            if (comptime !builtin.is_test and use_release_thread) log.warn(
                 "BUG: CFRelease pool was not empty, releasing remaining objects",
                 .{},
             );
         }
         self.cf_release_pool.deinit(self.alloc);
 
-        // Stop the CF release thread
-        {
+        // Stop the CF release thread (non-iOS only).
+        // On iOS the thread was never started — releases are synchronous.
+        if (use_release_thread) {
             self.cf_release_thread.stop.notify() catch |err|
                 log.err("error notifying cf release thread to stop, may stall err={}", .{err});
             self.cf_release_thr.join();
+            self.cf_release_thread.deinit();
+            self.alloc.destroy(self.cf_release_thread);
         }
-        self.cf_release_thread.deinit();
-        self.alloc.destroy(self.cf_release_thread);
     }
 
     pub fn endFrame(self: *Shaper) void {
@@ -279,22 +291,25 @@ pub const Shaper = struct {
             return;
         };
 
-        // Send the items. If the send succeeds then we wake up the
-        // thread to process the items. If the send fails then do a manual
-        // cleanup.
-        if (self.cf_release_thread.mailbox.push(.{ .release = .{
-            .refs = items,
-            .alloc = self.alloc,
-        } }, .{ .forever = {} }) != 0) {
-            self.cf_release_thread.wakeup.notify() catch |err| {
-                log.warn(
-                    "error notifying cf release thread to wake up, may stall err={}",
-                    .{err},
-                );
-            };
-            return;
+        // On platforms with the release thread, push to it. If the push
+        // fails (queue full), fall through to synchronous release.
+        if (use_release_thread) {
+            if (self.cf_release_thread.mailbox.push(.{ .release = .{
+                .refs = items,
+                .alloc = self.alloc,
+            } }, .{ .instant = {} }) != 0) {
+                self.cf_release_thread.wakeup.notify() catch |err| {
+                    log.warn(
+                        "error notifying cf release thread to wake up, may stall err={}",
+                        .{err},
+                    );
+                };
+                return;
+            }
         }
 
+        // Synchronous release — always used on iOS, fallback on other
+        // platforms when the release thread's mailbox is full.
         for (items) |ref| macos.foundation.CFRelease(ref);
         self.alloc.free(items);
     }

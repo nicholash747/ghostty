@@ -83,8 +83,9 @@ renderer_state: rendererpkg.State,
 /// The renderer thread manager
 renderer_thread: rendererpkg.Thread,
 
-/// The actual thread
-renderer_thr: std.Thread,
+/// The actual thread. Null for the manual backend where the host
+/// drives rendering directly (no concurrent renderer thread).
+renderer_thr: ?std.Thread,
 
 /// Mouse state.
 mouse: Mouse,
@@ -118,7 +119,8 @@ last_binding_trigger: u64 = 0,
 /// The terminal IO handler.
 io: termio.Termio,
 io_thread: termio.Thread,
-io_thr: std.Thread,
+/// Null for the manual backend where the host drives I/O directly.
+io_thr: ?std.Thread,
 
 /// Terminal inspector
 inspector: ?*inspectorpkg.Inspector = null,
@@ -592,12 +594,12 @@ pub fn init(
             .mutex = mutex,
             .terminal = &self.io.terminal,
         },
-        .renderer_thr = undefined,
+        .renderer_thr = null,
         .mouse = .{},
         .keyboard = .{},
         .io = undefined,
         .io_thread = io_thread,
-        .io_thr = undefined,
+        .io_thr = null,
         .size = size,
         .config = derived_config,
 
@@ -701,21 +703,28 @@ pub fn init(
     // setup on the main thread prior to spinning up the rendering thread.
     try renderer_impl.finalizeSurfaceInit(rt_surface);
 
-    // Start our renderer thread
-    self.renderer_thr = try std.Thread.spawn(
-        .{},
-        rendererpkg.Thread.threadMain,
-        .{&self.renderer_thread},
-    );
-    self.renderer_thr.setName("renderer") catch {};
+    // For the manual backend the host drives rendering and I/O
+    // directly from the main thread (ghostty_surface_update_frame,
+    // ghostty_surface_draw, ghostty_surface_feed_terminal_output).
+    // Spawning background threads would cause draw_mutex and
+    // swap_chain semaphore contention that freezes the main thread.
+    if (!self.isManualBackend()) {
+        // Start our renderer thread
+        self.renderer_thr = try std.Thread.spawn(
+            .{},
+            rendererpkg.Thread.threadMain,
+            .{&self.renderer_thread},
+        );
+        self.renderer_thr.?.setName("renderer") catch {};
 
-    // Start our IO thread
-    self.io_thr = try std.Thread.spawn(
-        .{},
-        termio.Thread.threadMain,
-        .{ &self.io_thread, &self.io },
-    );
-    self.io_thr.setName("io") catch {};
+        // Start our IO thread
+        self.io_thr = try std.Thread.spawn(
+            .{},
+            termio.Thread.threadMain,
+            .{ &self.io_thread, &self.io },
+        );
+        self.io_thr.?.setName("io") catch {};
+    }
 
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,
@@ -778,30 +787,48 @@ pub fn init(
 }
 
 pub fn deinit(self: *Surface) void {
+    const imux = @import("renderer/generic.zig");
+    imux.debugPrint("surface:deinit_start manual={}", .{self.isManualBackend()});
+
     // Stop search thread
     if (self.search) |*s| s.deinit();
+    imux.debugPrint("surface:deinit_search_done", .{});
 
     // Stop rendering thread
-    {
+    if (self.renderer_thr) |thr| {
         self.renderer_thread.stop.notify() catch |err|
             log.err("error notifying renderer thread to stop, may stall err={}", .{err});
-        self.renderer_thr.join();
+        thr.join();
 
         // We need to become the active rendering thread again
         self.renderer.threadEnter(self.rt_surface) catch unreachable;
     }
+    imux.debugPrint("surface:deinit_renderer_thr_done", .{});
 
     // Stop our IO thread
-    {
+    if (self.io_thr) |thr| {
         self.io_thread.stop.notify() catch |err|
             log.err("error notifying io thread to stop, may stall err={}", .{err});
-        self.io_thr.join();
+        thr.join();
     }
+    imux.debugPrint("surface:deinit_io_thr_done", .{});
 
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
     self.renderer_thread.deinit();
+
+    // For the manual backend, skip waiting for in-flight GPU frames.
+    // Sync draws (drawFrame(true)) guarantee frames complete before
+    // returning, so no GPU work should be in-flight. But if a frame
+    // permit was lost (e.g. iOS reclaimed the Metal device), the
+    // semaphore wait in SwapChain.deinit would block the main thread
+    // indefinitely, causing iOS to kill the app.
+    if (self.isManualBackend()) {
+        self.renderer.swap_chain.deinitSkipWait();
+    }
+    imux.debugPrint("surface:deinit_renderer_start", .{});
     self.renderer.deinit();
+    imux.debugPrint("surface:deinit_renderer_done", .{});
     self.io_thread.deinit();
     self.io.deinit();
 
@@ -823,6 +850,7 @@ pub fn deinit(self: *Surface) void {
     self.alloc.destroy(self.renderer_state.mutex);
     self.config.deinit();
 
+    imux.debugPrint("surface:deinit_complete", .{});
     log.info("surface closed addr={x}", .{@intFromPtr(self)});
 }
 
@@ -840,6 +868,38 @@ inline fn surfaceMailbox(self: *Surface) Mailbox {
     };
 }
 
+/// Returns true if this surface uses the manual I/O backend (no child
+/// process — the host feeds bytes directly). Used to make mailbox
+/// pushes non-blocking: on iOS the renderer and IO threads may not
+/// drain their mailboxes, so .forever would deadlock the main thread.
+inline fn isManualBackend(self: *const Surface) bool {
+    return switch (self.io.backend) {
+        .manual => true,
+        .exec => false,
+    };
+}
+
+/// Push a message to the renderer thread mailbox. For the manual
+/// backend, uses .instant (non-blocking, drops if full) to prevent
+/// deadlocking when the renderer thread isn't draining its mailbox.
+pub fn pushRenderer(self: *Surface, msg: rendererpkg.Message) void {
+    if (self.isManualBackend()) {
+        _ = self.renderer_thread.mailbox.push(msg, .{ .instant = {} });
+    } else {
+        _ = self.renderer_thread.mailbox.push(msg, .{ .forever = {} });
+    }
+}
+
+/// Push a message to the surface/app mailbox. For the manual backend,
+/// uses .instant (non-blocking) to prevent deadlocking.
+fn pushSurface(self: *Surface, msg: apprt.surface.Message) void {
+    if (self.isManualBackend()) {
+        _ = self.surfaceMailbox().push(msg, .{ .instant = {} });
+    } else {
+        _ = self.surfaceMailbox().push(msg, .{ .forever = {} });
+    }
+}
+
 /// Queue a message for the IO thread.
 ///
 /// We centralize all our logic into this spot so we can intercept
@@ -849,6 +909,15 @@ fn queueIo(
     msg: termio.Message,
     mutex: termio.Termio.MutexState,
 ) void {
+    // For the manual backend, skip the IO mailbox entirely.
+    // The IO thread is dead on iOS (xev doesn't run) and will
+    // never process these messages. Sending them fills the
+    // 64-slot SPSC queue and eventually blocks the main thread.
+    switch (self.io.backend) {
+        .manual => return,
+        else => {},
+    }
+
     // In readonly mode, we don't allow any writes through to the pty.
     if (self.readonly) {
         switch (msg) {
@@ -896,7 +965,7 @@ pub fn activateInspector(self: *Surface) !void {
     }
 
     // Notify our components we have an inspector active
-    _ = self.renderer_thread.mailbox.push(.{ .inspector = true }, .{ .forever = {} });
+    self.pushRenderer(.{ .inspector = true });
     self.queueIo(.{ .inspector = true }, .unlocked);
 }
 
@@ -913,7 +982,7 @@ pub fn deactivateInspector(self: *Surface) void {
     }
 
     // Notify our components we have deactivated inspector
-    _ = self.renderer_thread.mailbox.push(.{ .inspector = false }, .{ .forever = {} });
+    self.pushRenderer(.{ .inspector = false });
     self.queueIo(.{ .inspector = false }, .unlocked);
 
     // Deinit the inspector
@@ -1418,13 +1487,10 @@ fn searchCallback_(
             const matches = try alloc.dupe(terminal.highlight.Flattened, matches_unowned);
             for (matches) |*m| m.* = try m.clone(alloc);
 
-            _ = self.renderer_thread.mailbox.push(
-                .{ .search_viewport_matches = .{
-                    .arena = arena,
-                    .matches = matches,
-                } },
-                .forever,
-            );
+            self.pushRenderer(.{ .search_viewport_matches = .{
+                .arena = arena,
+                .matches = matches,
+            } });
             try self.renderer_thread.wakeup.notify();
         },
 
@@ -1436,67 +1502,40 @@ fn searchCallback_(
                 const alloc = arena.allocator();
                 const match = try sel.highlight.clone(alloc);
 
-                _ = self.renderer_thread.mailbox.push(
-                    .{ .search_selected_match = .{
-                        .arena = arena,
-                        .match = match,
-                    } },
-                    .forever,
-                );
+                self.pushRenderer(.{ .search_selected_match = .{
+                    .arena = arena,
+                    .match = match,
+                } });
 
                 // Send the selected index to the surface mailbox
-                _ = self.surfaceMailbox().push(
-                    .{ .search_selected = sel.idx },
-                    .forever,
-                );
+                self.pushSurface(.{ .search_selected = sel.idx });
             } else {
                 // Reset our selected match
-                _ = self.renderer_thread.mailbox.push(
-                    .{ .search_selected_match = null },
-                    .forever,
-                );
+                self.pushRenderer(.{ .search_selected_match = null });
 
                 // Reset the selected index
-                _ = self.surfaceMailbox().push(
-                    .{ .search_selected = null },
-                    .forever,
-                );
+                self.pushSurface(.{ .search_selected = null });
             }
 
             try self.renderer_thread.wakeup.notify();
         },
 
         .total_matches => |total| {
-            _ = self.surfaceMailbox().push(
-                .{ .search_total = total },
-                .forever,
-            );
+            self.pushSurface(.{ .search_total = total });
         },
 
         // When we quit, tell our renderer to reset any search state.
         .quit => {
-            _ = self.renderer_thread.mailbox.push(
-                .{ .search_selected_match = null },
-                .forever,
-            );
-            _ = self.renderer_thread.mailbox.push(
-                .{ .search_viewport_matches = .{
-                    .arena = .init(self.alloc),
-                    .matches = &.{},
-                } },
-                .forever,
-            );
+            self.pushRenderer(.{ .search_selected_match = null });
+            self.pushRenderer(.{ .search_viewport_matches = .{
+                .arena = .init(self.alloc),
+                .matches = &.{},
+            } });
             try self.renderer_thread.wakeup.notify();
 
             // Reset search totals in the surface
-            _ = self.surfaceMailbox().push(
-                .{ .search_total = null },
-                .forever,
-            );
-            _ = self.surfaceMailbox().push(
-                .{ .search_selected = null },
-                .forever,
-            );
+            self.pushSurface(.{ .search_total = null });
+            self.pushSurface(.{ .search_selected = null });
         },
 
         // Unhandled, so far.
@@ -1769,7 +1808,7 @@ pub fn updateConfig(
     termio_config_ptr.* = try termio.Termio.DerivedConfig.init(self.alloc, config);
     errdefer termio_config_ptr.deinit();
 
-    _ = self.renderer_thread.mailbox.push(renderer_message, .{ .forever = {} });
+    self.pushRenderer(renderer_message);
     self.queueIo(.{
         .change_config = .{
             .alloc = self.alloc,
@@ -2400,21 +2439,21 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 
     // Notify our render thread of the new font stack. The renderer
     // MUST accept the new font grid and deref the old.
-    _ = self.renderer_thread.mailbox.push(.{
+    self.pushRenderer(.{
         .font_grid = .{
             .grid = font_grid,
             .set = &self.app.font_grid_set,
             .old_key = self.font_grid_key,
             .new_key = font_grid_key,
         },
-    }, .{ .forever = {} });
+    });
 
     // Once we've sent the key we can replace our key
     self.font_grid_key = font_grid_key;
     self.font_metrics = font_grid.metrics;
 
     // Schedule render which also drains our mailbox
-    self.queueRender() catch unreachable;
+    self.queueRender() catch {};
 }
 
 /// This queues a render operation with the renderer thread. The render
@@ -2463,6 +2502,68 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
 
     // Mail the IO thread
     self.queueIo(.{ .resize = self.size }, .unlocked);
+}
+
+/// Directly resize the terminal grid without going through the IO thread.
+/// On iOS the IO thread's xev event loop doesn't run, so the normal
+/// resize path (queueIo -> IO thread -> Termio.resize) is dead.
+/// This performs the terminal resize synchronously on the calling thread.
+pub fn resizeTerminalDirect(self: *Surface) void {
+    const grid_size = self.size.grid();
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    self.io.terminal.resize(
+        self.alloc,
+        grid_size.columns,
+        grid_size.rows,
+    ) catch |err| {
+        log.warn("direct terminal resize failed: {}", .{err});
+        return;
+    };
+
+    self.io.terminal.width_px = grid_size.columns * self.size.cell.width;
+    self.io.terminal.height_px = grid_size.rows * self.size.cell.height;
+
+    // Disable synchronized output on resize (per spec).
+    self.io.terminal.modes.set(.synchronized_output, false);
+}
+
+/// Drain the IO thread's mailbox directly from the calling thread.
+/// On iOS the IO thread's xev event loop doesn't run, so messages
+/// (write responses, resize, etc.) accumulate in the mailbox until
+/// the 64-slot SPSC queue fills and blocks the producer forever.
+/// This processes write messages by forwarding data to the Manual
+/// backend's input ring (terminal responses → SSH) and discards
+/// the rest (resize is handled by resizeTerminalDirect).
+pub fn drainIOMailbox(self: *Surface) void {
+    const queue = switch (self.io.mailbox) {
+        .spsc => |v| v.queue,
+    };
+
+    while (queue.pop()) |message| {
+        switch (message) {
+            .write_small => |v| self.writeToManualInput(v.data[0..v.len]),
+            .write_stable => |v| self.writeToManualInput(v),
+            .write_alloc => |v| {
+                self.writeToManualInput(v.data);
+                v.alloc.free(v.data);
+            },
+            else => {},
+        }
+    }
+}
+
+fn writeToManualInput(self: *Surface, data: []const u8) void {
+    switch (self.io.backend) {
+        .manual => |*m| {
+            m.mutex.lock();
+            defer m.mutex.unlock();
+            _ = m.input_ring.write(data);
+        },
+        .exec => {},
+    }
 }
 
 /// Recalculate the balanced padding if needed.
@@ -3252,9 +3353,7 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
-    _ = self.renderer_thread.mailbox.push(.{
-        .visible = visible,
-    }, .{ .forever = {} });
+    self.pushRenderer(.{ .visible = visible });
     try self.queueRender();
 }
 
@@ -3268,9 +3367,7 @@ pub fn focusCallback(self: *Surface, focused: bool) !void {
     self.focused = focused;
 
     // Notify our render thread of the new state
-    _ = self.renderer_thread.mailbox.push(.{
-        .focus = focused,
-    }, .{ .forever = {} });
+    self.pushRenderer(.{ .focus = focused });
 
     if (focused) {
         // Notify our app if we gained focus.
@@ -5884,7 +5981,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             .main => @panic("crash binding action, crashing intentionally"),
 
             .render => {
-                _ = self.renderer_thread.mailbox.push(.{ .crash = {} }, .{ .forever = {} });
+                self.pushRenderer(.{ .crash = {} });
                 self.queueRender() catch |err| {
                     // Not a big deal if this fails.
                     log.warn("failed to notify renderer of crash message err={}", .{err});

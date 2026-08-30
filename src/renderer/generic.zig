@@ -43,6 +43,53 @@ const DisplayLink = switch (builtin.os.tag) {
 
 const log = std.log.scoped(.generic_renderer);
 
+/// Global debug ring buffer readable from host via ghostty_debug_read().
+/// Lock-free: single writer (renderer thread), single reader (main thread).
+const DebugRing = struct {
+    const SIZE = 8192;
+    var buf: [SIZE]u8 = .{0} ** SIZE;
+    var write_pos: usize = 0;
+    var read_pos: usize = 0;
+
+    fn append(data: []const u8) void {
+        for (data) |byte| {
+            buf[write_pos % SIZE] = byte;
+            write_pos +%= 1;
+        }
+    }
+
+    fn read(out: [*]u8, max: usize) usize {
+        var count: usize = 0;
+        while (read_pos != write_pos and count < max) {
+            out[count] = buf[read_pos % SIZE];
+            read_pos +%= 1;
+            count += 1;
+        }
+        return count;
+    }
+};
+
+/// Debug print that survives ReleaseFast. Writes to global ring buffer
+/// readable via ghostty_debug_read() C export.
+fn imuxDebug(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const slice = std.fmt.bufPrint(&buf, "[imux:renderer] " ++ fmt ++ "\n", args) catch return;
+    DebugRing.append(slice);
+}
+
+/// Public debug print for use by Metal.zig and other renderer modules.
+pub fn debugPrint(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    DebugRing.append(slice);
+}
+
+/// C-exported function: read pending debug messages from the renderer.
+/// Returns number of bytes written to buf. Call periodically from host.
+export fn ghostty_debug_read(out: [*]u8, len: usize) usize {
+    return DebugRing.read(out, len);
+}
+
 /// Create a renderer type with the provided graphics API wrapper.
 ///
 /// The graphics API wrapper must provide the interface outlined below.
@@ -274,12 +321,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *SwapChain) void {
+                self.deinitImpl(false);
+            }
+
+            /// Deinit without waiting for in-flight frames.
+            /// Use for the manual backend where sync draws
+            /// guarantee no GPU work is in-flight, and waiting
+            /// on the semaphore can deadlock if a frame permit
+            /// was lost (e.g. Metal device reclaimed by iOS).
+            pub fn deinitSkipWait(self: *SwapChain) void {
+                self.deinitImpl(true);
+            }
+
+            fn deinitImpl(self: *SwapChain, skip_wait: bool) void {
                 if (self.defunct) return;
                 self.defunct = true;
 
-                // Wait for all of our inflight draws to complete
-                // so that we can cleanly deinit our GPU state.
-                for (0..buf_count) |_| self.frame_sema.wait();
+                if (!skip_wait) {
+                    // Wait for all of our inflight draws to complete
+                    // so that we can cleanly deinit our GPU state.
+                    for (0..buf_count) |_| self.frame_sema.wait();
+                }
                 for (&self.frames) |*frame| frame.deinit();
             }
 
@@ -798,6 +860,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            imuxDebug("renderer:deinit_start", .{});
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
@@ -813,7 +876,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.cells.deinit(self.alloc);
 
+            imuxDebug("renderer:deinit_font_shaper", .{});
             self.font_shaper.deinit();
+            imuxDebug("renderer:deinit_font_shaper_done", .{});
             self.font_shaper_cache.deinit(self.alloc);
 
             self.config.deinit();
@@ -825,6 +890,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.deinitShaders();
 
             self.api.deinit();
+            imuxDebug("renderer:deinit_complete", .{});
 
             self.* = undefined;
         }
@@ -1125,15 +1191,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             state: *renderer.State,
             cursor_blink_visible: bool,
         ) Allocator.Error!void {
-            // const start = std.time.Instant.now() catch unreachable;
-            // const start_micro = std.time.microTimestamp();
-            // defer {
-            //     const end = std.time.Instant.now() catch unreachable;
-            //     log.warn(
-            //         "[updateFrame time] start_micro={} duration={}ns",
-            //         .{ start_micro, end.since(start) / std.time.ns_per_us },
-            //     );
-            // }
+            imuxDebug("updateFrame:enter", .{});
 
             // We fully deinit and reset the terminal state every so often
             // so that a particularly large terminal state doesn't cause
@@ -1170,8 +1228,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 //     std.log.err("[updateFrame critical time] start={}\tduration={} us", .{ start_micro, end.since(start) / std.time.ns_per_us });
                 // }
 
+                imuxDebug("updateFrame:mutex_locking", .{});
                 state.mutex.lock();
                 defer state.mutex.unlock();
+                imuxDebug("updateFrame:mutex_locked", .{});
 
                 // If we're in a synchronized output state, we pause all rendering.
                 if (state.terminal.modes.get(.synchronized_output)) {
@@ -1200,7 +1260,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 // Update our terminal state
+                imuxDebug("updateFrame:terminal_state_update", .{});
                 try self.terminal_state.update(self.alloc, state.terminal);
+                imuxDebug("updateFrame:terminal_state_done", .{});
 
                 // If our terminal state is dirty at all we need to redo
                 // the viewport search.
@@ -1278,6 +1340,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .overlay_features = overlay_features,
                 };
             };
+
+            imuxDebug("updateFrame:critical_done", .{});
 
             // Outside the critical area we can update our links to contain
             // our regex results.
@@ -1407,6 +1471,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Prepare our overlay image for upload (or unload). This
                 // has to use our general allocator since it modifies
                 // state that survives frames.
+                imuxDebug("updateFrame:overlay", .{});
                 self.images.overlayUpdate(
                     self.alloc,
                     self.overlay,
@@ -1415,12 +1480,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 // Update custom shader uniforms that depend on terminal state.
+                imuxDebug("updateFrame:customShaders", .{});
                 self.updateCustomShaderUniformsFromState();
+                imuxDebug("updateFrame:draw_mutex_unlocking", .{});
             }
 
             // Notify our shaper we're done for the frame. For some shapers,
             // such as CoreText, this triggers off-thread cleanup logic.
+            imuxDebug("updateFrame:endFrame", .{});
             self.font_shaper.endFrame();
+            imuxDebug("updateFrame:done", .{});
         }
 
         /// Draw the frame to the screen.
@@ -1443,8 +1512,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // We hold a the draw mutex to prevent changes to any
             // data we access while we're in the middle of drawing.
+            imuxDebug("drawFrame:draw_mutex_locking", .{});
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
+            imuxDebug("drawFrame:draw_mutex_locked", .{});
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.
@@ -1480,6 +1551,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.hasAnimations() or
                 sync;
 
+            // Only log drawFrame when sync (explicit draw call) or size changed
+            if (sync or size_changed)
+                imuxDebug("drawFrame surface={}x{} size_changed={} rebuilt={}", .{
+                    surface_size.width, surface_size.height,
+                    size_changed, self.cells_rebuilt,
+                });
+
             if (!needs_redraw) {
                 // We still need to present the last target again, because the
                 // apprt may be swapping buffers and display an outdated frame
@@ -1490,7 +1568,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells_rebuilt = false;
 
             // Wait for a frame to be available.
+            imuxDebug("drawFrame:nextFrame", .{});
             const frame = try self.swap_chain.nextFrame();
+            imuxDebug("drawFrame:gotFrame", .{});
             errdefer self.swap_chain.releaseFrame();
             // log.debug("drawing frame index={}", .{self.swap_chain.frame_index});
 
@@ -1559,6 +1639,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try frame.uniforms.sync(&.{self.uniforms});
             try frame.cells_bg.sync(self.cells.bg_cells);
             const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows.lists);
+            // Only log frame stats when cells were rebuilt
+            if (self.cells_rebuilt)
+                imuxDebug("frame fg={} grid={}x{}", .{
+                    fg_count, self.cells.size.columns, self.cells.size.rows,
+                });
 
             // If our background image buffer has changed, sync it.
             if (frame.bg_image_buffer_modified != self.bg_image_buffer_modified) {
@@ -1586,8 +1671,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Get a frame context from the graphics API.
+            imuxDebug("drawFrame:beginFrame", .{});
             var frame_ctx = try self.api.beginFrame(self, &frame.target);
-            defer frame_ctx.complete(sync);
+            defer {
+                imuxDebug("drawFrame:complete sync={}", .{sync});
+                frame_ctx.complete(sync);
+                imuxDebug("drawFrame:complete_done", .{});
+            }
 
             {
                 var pass = frame_ctx.renderPass(&.{.{
@@ -1732,9 +1822,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Our health value changed, so we notify the surface so that it
                 // can do something about it.
+                // Use .instant to avoid blocking the caller
+                // (may be the main thread on iOS).
                 _ = self.surface_mailbox.push(.{
                     .renderer_health = health,
-                }, .{ .forever = {} });
+                }, .{ .instant = {} });
             }
 
             // Always release our semaphore
@@ -2601,10 +2693,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Update that our cells rebuilt
             self.cells_rebuilt = true;
 
-            // Log some things
-            // log.debug("rebuildCells complete cached_runs={}", .{
-            //     self.font_shaper_cache.count(),
-            // });
+            // Count cells for debug
+            var total_fg: usize = 0;
+            for (self.cells.fg_rows.lists) |list| {
+                total_fg += list.items.len;
+            }
+            imuxDebug("rebuildCells complete total_fg={} grid={}x{}", .{
+                total_fg, self.cells.size.columns, self.cells.size.rows,
+            });
         }
 
         fn rebuildRow(

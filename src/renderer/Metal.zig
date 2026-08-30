@@ -217,9 +217,6 @@ pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
     const bounds = self.layer.layer.getProperty(graphics.Rect, "bounds");
     const scale = self.layer.layer.getProperty(f64, "contentsScale");
 
-    // We need to clamp our runtime surface size to the maximum
-    // possible texture size since we can't create a screen buffer (texture)
-    // larger than that.
     return .{
         .width = @min(
             @as(u32, @intFromFloat(bounds.size.width * scale)),
