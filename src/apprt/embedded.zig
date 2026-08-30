@@ -517,12 +517,16 @@ pub const Surface = struct {
         }
 
         // If we have a command from the options then we set it.
+        // If command is NULL, clear config.command so the manual
+        // backend is selected (no child process spawned).
         if (opts.command) |c_command| {
             const cmd = std.mem.sliceTo(c_command, 0);
             if (cmd.len > 0) {
                 config.command = .{ .shell = cmd };
                 config.@"wait-after-command" = true;
             }
+        } else {
+            config.command = null;
         }
 
         // Apply any environment variables that were requested.
@@ -1655,6 +1659,118 @@ pub const CAPI = struct {
         ptr.deinit();
     }
 
+    /// Force-update the renderer frame data (rebuild cells from terminal
+    /// state). On iOS the renderer thread's xev event loop doesn't run,
+    /// so updateFrame() is never called via the normal renderCallback path.
+    /// Call this from the host before ghostty_surface_refresh().
+    export fn ghostty_surface_update_frame(surface: *Surface) void {
+        const thread = &surface.core_surface.renderer_thread;
+        thread.renderer.updateFrame(
+            thread.state,
+            thread.flags.cursor_blink_visible,
+        ) catch {};
+    }
+
+    /// Scroll the terminal viewport to the bottom (most recent output).
+    /// Direct call that bypasses the termio thread mailbox (which
+    /// doesn't run on iOS due to xev). Locks the renderer state
+    /// mutex to safely modify the viewport.
+    export fn ghostty_surface_scroll_to_bottom(surface: *Surface) void {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        state.terminal.scrollViewport(.{ .bottom = {} });
+    }
+
+    /// Scroll the viewport by a delta number of rows. Negative = up
+    /// (view older), positive = down (view newer). Direct call that
+    /// bypasses the termio thread mailbox. Returns true if the
+    /// viewport is at the bottom after scrolling.
+    export fn ghostty_surface_scroll_viewport(
+        surface: *Surface,
+        delta: i32,
+    ) bool {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        state.terminal.scrollViewport(.{ .delta = @as(isize, delta) });
+        return state.terminal.screens.active.viewportIsBottom();
+    }
+
+    /// Scroll the viewport by a delta number of rows and report edge
+    /// state in both directions. Returns a bitmask: bit 0 = viewport
+    /// is at the bottom after scrolling, bit 1 = the scroll hit an
+    /// edge (nonzero delta produced no viewport movement). Direct
+    /// call that bypasses the termio thread mailbox (dead on iOS).
+    export fn ghostty_surface_scroll_viewport2(
+        surface: *Surface,
+        delta: i32,
+    ) u32 {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        const before = state.terminal.screens.active.pages
+            .getTopLeft(.viewport);
+        state.terminal.scrollViewport(.{ .delta = @as(isize, delta) });
+        const after = state.terminal.screens.active.pages
+            .getTopLeft(.viewport);
+        var flags: u32 = 0;
+        if (state.terminal.screens.active.viewportIsBottom())
+            flags |= 1;
+        const moved = before.node != after.node or
+            before.y != after.y or before.x != after.x;
+        if (delta != 0 and !moved) flags |= 2;
+        return flags;
+    }
+
+    /// Read the scrollback extent and viewport position, in rows:
+    /// total rows (history + screen), the viewport's offset from the
+    /// top, and the viewport length. Lets the embedder drive a REAL
+    /// scroll view (contentSize/contentOffset) instead of simulating
+    /// scroll physics. Direct call; locks the renderer state mutex.
+    export fn ghostty_surface_scrollbar(
+        surface: *Surface,
+        total: *u64,
+        offset: *u64,
+        len: *u64,
+    ) void {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        const sb = state.terminal.screens.active.pages.scrollbar();
+        const c = sb.cval();
+        total.* = c.total;
+        offset.* = c.offset;
+        len.* = c.len;
+    }
+
+    /// Directly resize the terminal grid, bypassing the IO thread.
+    /// On iOS the IO thread's xev event loop doesn't run, so the
+    /// normal resize path through queueIo is dead. Updates the screen
+    /// size and resizes the terminal grid in one call. Use this
+    /// INSTEAD of ghostty_surface_set_size() on iOS.
+    export fn ghostty_surface_resize_terminal(
+        surface: *Surface,
+        w: u32,
+        h: u32,
+    ) void {
+        const new_size: renderer.ScreenSize = .{
+            .width = w,
+            .height = h,
+        };
+        if (surface.core_surface.size.screen.equals(new_size)) return;
+        surface.core_surface.size.screen = new_size;
+        surface.core_surface.resizeTerminalDirect();
+    }
+
+    /// Drain the IO thread's mailbox from the main thread. On iOS
+    /// the IO thread never runs, so messages accumulate until the
+    /// 64-slot queue fills and blocks the producer (main thread).
+    /// Call this periodically (e.g. every tick) to prevent freezes.
+    export fn ghostty_surface_drain_io_mailbox(surface: *Surface) void {
+        surface.core_surface.drainIOMailbox();
+    }
+
     /// Tell the surface that it needs to schedule a render
     export fn ghostty_surface_refresh(surface: *Surface) void {
         surface.refresh();
@@ -2125,10 +2241,7 @@ pub const CAPI = struct {
     const Darwin = struct {
         export fn ghostty_surface_set_display_id(ptr: *Surface, display_id: u32) void {
             const surface = &ptr.core_surface;
-            _ = surface.renderer_thread.mailbox.push(
-                .{ .macos_display_id = display_id },
-                .{ .forever = {} },
-            );
+            surface.pushRenderer(.{ .macos_display_id = display_id });
             surface.renderer_thread.wakeup.notify() catch {};
         }
 

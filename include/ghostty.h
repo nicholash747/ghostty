@@ -1143,6 +1143,29 @@ void ghostty_surface_feed_terminal_output(ghostty_surface_t, const void*, size_t
 /// if the surface is not using the manual backend. Thread-safe.
 size_t ghostty_surface_read_terminal_input(ghostty_surface_t, void*, size_t);
 
+/// Read debug messages from the renderer thread's ring buffer.
+/// Returns number of bytes written. Call periodically from main thread.
+size_t ghostty_debug_read(void*, size_t);
+
+/// Force-update renderer frame data (rebuild cells from terminal state).
+/// Call before ghostty_surface_refresh() on platforms where the renderer
+/// thread event loop doesn't run (e.g. iOS).
+void ghostty_surface_update_frame(ghostty_surface_t);
+
+/// Scroll the viewport to the bottom. Direct call — does not use
+/// the termio thread mailbox.
+void ghostty_surface_scroll_to_bottom(ghostty_surface_t);
+
+/// Directly resize the terminal grid, bypassing the IO thread.
+/// Use INSTEAD of ghostty_surface_set_size() on iOS where the IO
+/// thread event loop doesn't run.
+void ghostty_surface_resize_terminal(ghostty_surface_t, uint32_t w, uint32_t h);
+
+/// Drain the IO thread's mailbox from the main thread.
+/// Call periodically on iOS to prevent the 64-slot queue from
+/// filling and blocking the main thread forever.
+void ghostty_surface_drain_io_mailbox(ghostty_surface_t);
+
 ghostty_inspector_t ghostty_surface_inspector(ghostty_surface_t);
 void ghostty_inspector_free(ghostty_surface_t);
 void ghostty_inspector_set_focus(ghostty_inspector_t, bool);
