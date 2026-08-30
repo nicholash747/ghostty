@@ -1847,6 +1847,27 @@ pub const CAPI = struct {
         return n;
     }
 
+    /// Copy the ENTIRE screen contents (scrollback + visible rows,
+    /// newline-joined UTF-8) into buf. Returns bytes written;
+    /// truncates at buf_len. Line index equals absolute row, so the
+    /// host's text offsets stay stable across scrolling.
+    export fn ghostty_surface_screen_text(
+        surface: *Surface,
+        buf: [*]u8,
+        buf_len: usize,
+    ) usize {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        const alloc = surface.core_surface.alloc;
+        const text = state.terminal.screens.active
+            .dumpStringAlloc(alloc, .{ .screen = .{} }) catch return 0;
+        defer alloc.free(text);
+        const n = @min(text.len, buf_len);
+        @memcpy(buf[0..n], text[0..n]);
+        return n;
+    }
+
     /// True when the running program enabled bracketed paste (mode
     /// 2004): pasted text must be wrapped in ESC[200~ / ESC[201~ so
     /// multiline pastes arrive as one paste event instead of
