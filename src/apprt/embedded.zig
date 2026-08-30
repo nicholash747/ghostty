@@ -1847,6 +1847,17 @@ pub const CAPI = struct {
         return n;
     }
 
+    /// True when the running program enabled bracketed paste (mode
+    /// 2004): pasted text must be wrapped in ESC[200~ / ESC[201~ so
+    /// multiline pastes arrive as one paste event instead of
+    /// executing line by line.
+    export fn ghostty_surface_bracketed_paste(surface: *Surface) bool {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        return state.terminal.modes.get(.bracketed_paste);
+    }
+
     /// True when the running program enabled any xterm mouse reporting
     /// mode - taps should then be forwarded as mouse clicks so TUIs
     /// (e.g. Claude Code) can move their cursor to the tapped cell.
