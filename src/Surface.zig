@@ -4569,6 +4569,34 @@ fn linkAtPin(
     return null;
 }
 
+/// Read a link destination at an exact viewport cell without changing mouse,
+/// selection, clipboard, or terminal input state. The caller owns the result.
+/// Requires the renderer state mutex is held.
+pub fn linkTextAtCellLocked(
+    self: *Surface,
+    alloc: Allocator,
+    col: u32,
+    row: u32,
+) !?[:0]const u8 {
+    const screen = self.renderer_state.terminal.screens.active;
+    if (col >= screen.pages.cols or row >= screen.pages.rows) return null;
+    const pin = screen.pages.pin(.{ .viewport = .{
+        .x = @intCast(col),
+        .y = @intCast(row),
+    } }) orelse return null;
+
+    // OSC 8 labels need not resemble the destination. Prefer their metadata
+    // over a regex match on the displayed text, just as command-click does.
+    if (self.osc8URI(pin)) |uri| return try alloc.dupeZ(u8, uri);
+    const link = try self.linkAtPin(pin, null) orelse return null;
+    const text = try screen.selectionString(alloc, .{
+        .sel = link.selection,
+        .trim = false,
+    });
+    defer alloc.free(text);
+    return try alloc.dupeZ(u8, text);
+}
+
 /// This returns the mouse mods to consider for link highlighting or
 /// other purposes taking into account when shift is pressed for releasing
 /// the mouse from capture.

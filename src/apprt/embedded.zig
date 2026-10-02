@@ -1655,6 +1655,28 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Read the URL at an exact viewport cell, ignoring mouse modifiers.
+    /// No input or UI state is changed. Free a successful result with
+    /// ghostty_surface_free_text, as with the other text-reading APIs.
+    export fn ghostty_surface_read_link(
+        surface: *Surface,
+        col: u32,
+        row: u32,
+        result: *Text,
+    ) bool {
+        result.* = std.mem.zeroes(Text);
+        const core = &surface.core_surface;
+        core.renderer_state.mutex.lock();
+        defer core.renderer_state.mutex.unlock();
+        const text = (core.linkTextAtCellLocked(global.alloc, col, row) catch |err| {
+            log.warn("error reading link err={}", .{err});
+            return false;
+        }) orelse return false;
+        result.text = text.ptr;
+        result.text_len = text.len;
+        return true;
+    }
+
     export fn ghostty_surface_free_text(ptr: *Text) void {
         ptr.deinit();
     }
