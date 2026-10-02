@@ -2555,6 +2555,16 @@ pub fn drainIOMailbox(self: *Surface) void {
     }
 }
 
+/// Apply queued renderer messages (config, font grid, resize, focus...)
+/// from the host thread. With the manual backend the renderer thread
+/// never runs, so without this a theme or font change only shows up on
+/// surfaces created afterwards.
+pub fn drainRendererMailbox(self: *Surface) void {
+    self.renderer_thread.drainMailboxHostDriven() catch |err| {
+        log.err("error draining renderer mailbox err={}", .{err});
+    };
+}
+
 fn writeToManualInput(self: *Surface, data: []const u8) void {
     switch (self.io.backend) {
         .manual => |*m| {

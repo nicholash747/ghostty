@@ -1168,6 +1168,7 @@ void ghostty_surface_resize_terminal(ghostty_surface_t, uint32_t w, uint32_t h);
 /// Call periodically on iOS to prevent the 64-slot queue from
 /// filling and blocking the main thread forever.
 void ghostty_surface_drain_io_mailbox(ghostty_surface_t);
+void ghostty_surface_drain_renderer_mailbox(ghostty_surface_t);
 
 ghostty_inspector_t ghostty_surface_inspector(ghostty_surface_t);
 void ghostty_inspector_free(ghostty_surface_t);

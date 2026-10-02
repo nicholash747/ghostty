@@ -335,6 +335,21 @@ fn syncDrawTimer(self: *Thread) void {
 
 /// Drain the mailbox.
 fn drainMailbox(self: *Thread) !void {
+    try self.processMailbox(false);
+}
+
+/// Drain the mailbox from the host's thread. For the manual backend
+/// (iOS) the renderer thread's xev loop never runs, so nothing else
+/// ever drains it: config, font grid and resize messages would sit
+/// unapplied (and the queue fills, dropping later pushes). Applies the
+/// same state changes but skips thread-affine work: QoS classes would
+/// retag the caller's thread, xev timers never fire, and the host
+/// drives drawing itself.
+pub fn drainMailboxHostDriven(self: *Thread) !void {
+    try self.processMailbox(true);
+}
+
+fn processMailbox(self: *Thread, comptime host_driven: bool) !void {
     // There's probably a more elegant way to do this...
     //
     // This is effectively an @autoreleasepool{} block, which we need in
@@ -357,13 +372,15 @@ fn drainMailbox(self: *Thread) !void {
                 // Set our visible state
                 self.flags.visible = v;
 
-                // Visibility affects our QoS class
-                self.setQosClass();
+                if (!host_driven) {
+                    // Visibility affects our QoS class
+                    self.setQosClass();
 
-                // If we became visible then we immediately trigger a draw.
-                // We don't need to update frame data because that should
-                // still be happening.
-                if (v) self.drawFrame(false);
+                    // If we became visible then we immediately trigger a draw.
+                    // We don't need to update frame data because that should
+                    // still be happening.
+                    if (v) self.drawFrame(false);
+                }
 
                 // Notify the renderer so it can update any state.
                 self.renderer.setVisible(v);
@@ -384,10 +401,14 @@ fn drainMailbox(self: *Thread) !void {
                 self.flags.focused = v;
 
                 // Focus affects our QoS class
-                self.setQosClass();
+                if (!host_driven) self.setQosClass();
 
                 // Set it on the renderer
                 try self.renderer.setFocus(v);
+
+                // The draw and cursor blink timers below live on the xev
+                // loop, which a host-driven renderer never runs.
+                if (host_driven) break :focus;
 
                 // We always resync our draw timer (may disable it)
                 self.syncDrawTimer();
@@ -453,7 +474,7 @@ fn drainMailbox(self: *Thread) !void {
 
                 // Stop and start the draw timer to capture the new
                 // hasAnimations value.
-                self.syncDrawTimer();
+                if (!host_driven) self.syncDrawTimer();
             },
 
             .search_viewport_matches => |v| {

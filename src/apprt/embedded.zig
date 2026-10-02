@@ -1938,6 +1938,14 @@ pub const CAPI = struct {
         surface.core_surface.drainIOMailbox();
     }
 
+    /// Apply queued renderer messages from the main thread. On iOS
+    /// the renderer thread never runs, so config changes (theme
+    /// colors, fonts) pushed by ghostty_surface_update_config would
+    /// otherwise never reach the renderer. Call before update_frame.
+    export fn ghostty_surface_drain_renderer_mailbox(surface: *Surface) void {
+        surface.core_surface.drainRendererMailbox();
+    }
+
     /// Tell the surface that it needs to schedule a render
     export fn ghostty_surface_refresh(surface: *Surface) void {
         surface.refresh();
