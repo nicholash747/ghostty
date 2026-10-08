@@ -1890,6 +1890,38 @@ pub const CAPI = struct {
         return n;
     }
 
+    /// Copy screen rows from absolute row `first_row` to the bottom,
+    /// formatted exactly as ghostty_surface_screen_text formats them
+    /// (visual rows, newline-joined), so the host can refresh only the
+    /// rows that may have changed instead of re-reading all scrollback.
+    /// Copies at most buf_len bytes and returns the FULL length: retry
+    /// with a larger buffer when the result exceeds buf_len. Returns 0
+    /// when first_row is past the last row.
+    export fn ghostty_surface_screen_rows_text(
+        surface: *Surface,
+        first_row: u64,
+        buf: [*]u8,
+        buf_len: usize,
+    ) usize {
+        const state = surface.core_surface.renderer_thread.state;
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        const screen = state.terminal.screens.active;
+        const y = std.math.cast(u32, first_row) orelse return 0;
+        const tl = screen.pages.pin(.{ .screen = .{ .y = y } }) orelse return 0;
+        var builder: std.Io.Writer.Allocating = .init(surface.core_surface.alloc);
+        defer builder.deinit();
+        screen.dumpString(&builder.writer, .{
+            .tl = tl,
+            .br = screen.pages.getBottomRight(.screen),
+            .unwrap = false,
+        }) catch return 0;
+        const text = builder.written();
+        const n = @min(text.len, buf_len);
+        @memcpy(buf[0..n], text[0..n]);
+        return text.len;
+    }
+
     /// True when the running program enabled bracketed paste (mode
     /// 2004): pasted text must be wrapped in ESC[200~ / ESC[201~ so
     /// multiline pastes arrive as one paste event instead of
